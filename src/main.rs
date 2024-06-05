@@ -1,11 +1,12 @@
 use clap::{App, Arg, SubCommand};
-use tokio::fs::File;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use reqwest::header::SET_COOKIE;
 use reqwest::Client;
 use serde::Serialize;
-use serde_json::json;
-use std::collections::HashMap;
+use std::path::Path;
+use std::fs::File;
+use tar;
 
 #[derive(Serialize)]
 struct User {
@@ -32,12 +33,10 @@ async fn main() {
                 .arg(Arg::with_name("password").help("The password for the account").required(true).index(2)),
         )
         .subcommand(
-            SubCommand::with_name("publish")
-                .about("Publish a package")
-                .arg(Arg::with_name("filename").help("The filename of the package").required(true).index(1))
-                .arg(Arg::with_name("name").help("The name of the package").required(true).index(2))
-                .arg(Arg::with_name("version").help("The version of the package").required(true).index(3))
-                .arg(Arg::with_name("description").help("The description of the package").required(true).index(4)),
+            SubCommand::with_name("install")
+                .about("Install a package")
+                .arg(Arg::with_name("name").help("The name of the package").required(true).index(1))
+                .arg(Arg::with_name("version").help("The version of the package").required(false).index(2)),
         )
         .get_matches();
 
@@ -49,12 +48,10 @@ async fn main() {
         let username = matches.value_of("username").unwrap();
         let password = matches.value_of("password").unwrap();
         login(username, password).await;
-    } else if let Some(matches) = matches.subcommand_matches("publish") {
-        let filename = matches.value_of("filename").unwrap();
+    } else if let Some(matches) = matches.subcommand_matches("install") {
         let name = matches.value_of("name").unwrap();
         let version = matches.value_of("version").unwrap();
-        let description = matches.value_of("description").unwrap();
-        publish(filename, name, version, description).await;
+        install(name, Some(version)).await;
     } else if let Some(_) = matches.subcommand_matches("install") {
         println!("Install command not implemented yet");
     } else {
@@ -112,40 +109,84 @@ async fn login(username: &str, password: &str) {
     }
 }
 
-async fn publish(filename: &str, name: &str, version: &str, description: &str) {
-    let username = fs::read_to_string("username").await.expect("Unable to read file");
-
-    let package_data = json!({
-        "name": name,
-        "version": version,
-        "description": description
-    });
-
-    let mut data = HashMap::new();
-    data.insert("json", package_data.to_string());
-
+async fn install(name: &str, version: Option<&str>) {
     let client = Client::new();
-    let session_id = fs::read_to_string("session_id").await.expect("Unable to read file");
-    
-    match File::open(&filename).await {
-        Ok(_) => {
-            let cookie_string = format!("session={}", session_id);
-            let file_bytes = fs::read(&filename).await.expect("Unable to read file");
-            let part = reqwest::multipart::Part::bytes(file_bytes).file_name(filename.to_string());
-            let form = reqwest::multipart::Form::new()
-                .text("json", package_data.to_string())
-                .part("file", part);
-            
-            let response = client.post("http://localhost:5000/publish")
-                .multipart(form)
-                .header("Cookie", cookie_string)
-                .send()
-                .await
-                .expect("Failed to send request");
-            println!("{}", response.text().await.unwrap());
-        },
-        Err(_) => {
-            println!("\x1b[31mFile {} not found!\x1b[0m", filename);
-        },
+
+    let version = match version {
+        Some(v) => v.to_string(),
+        None => {
+            match get_latest_version(name).await {
+                Some(v) => v,
+                None => {
+                    println!("Unable to determine the latest version for {}", name);
+                    return;
+                }
+            }
+        }
+    };
+
+    println!("Installing {} version {}", name, version);
+
+    let url = format!("http://localhost:5000/packages/{}-{}", name, version);
+    let response = client.get(&url).send().await.expect("Failed to send request");
+    let file_path = format!("{}-{}.xz", name, version);
+
+    if response.status().is_success() {
+        let response_bytes = response.bytes().await.expect("Failed to read response bytes");
+        let package_data = response_bytes.clone();
+        
+        // Save the package data to a file
+        let mut file = tokio::fs::File::create(&file_path)
+            .await
+            .expect("Unable to create file");
+
+        file.write_all(&package_data)
+            .await
+            .expect("Unable to write file");
+
+        println!("Package downloaded successfully and saved to {}", file_path);
+    } else {
+        println!("\x1b[31mError downloading package {}: {}\x1b[0m", name, response.status());
     }
+
+    // Extract the downloaded file to "/"
+    let extract_path = Path::new("/");
+    let extract_result = tar::Archive::new(File::open(&file_path).expect("Unable to open file")).unpack(extract_path);
+
+    match extract_result {
+        Ok(_) => {
+            println!("Package extracted successfully to {}", extract_path.display());
+        }
+        Err(e) => {
+            println!("Failed to extract package: {}", e);
+        }
+    }
+
+    println!("{}-{} Package downloaded successfully and Installed to {}", name, version, file_path);
+}
+    
+
+async fn get_latest_version(name: &str) -> Option<String> {
+    let client = Client::new();
+    let url = format!("http://localhost:5000/versions/{}", name);
+    let response = client.get(&url).send().await;
+
+    match response {
+        Ok(response) => {
+            if response.status().is_success() {
+                let versions: Vec<String> = response.json().await.expect("Failed to parse JSON");
+                if !versions.is_empty() {
+                    let latest_version = versions.iter().max().unwrap().to_owned();
+                    return Some(latest_version);
+                }
+            } else {
+                println!("\x1b[31mError fetching latest version for {}: {}\x1b[0m", name, response.status());
+            }
+        }
+        Err(e) => {
+            println!("\x1b[31mError fetching latest version for {}: {}\x1b[0m", name, e);
+        }
+    }
+
+    None
 }
