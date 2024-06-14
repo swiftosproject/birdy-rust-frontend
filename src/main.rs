@@ -65,8 +65,8 @@ async fn main() {
         install(name, version).await;
     } else if let Some(matches) = matches.subcommand_matches("remove") {
         let name = matches.value_of("name").unwrap();
-        let version = matches.value_of("version").unwrap();
-        remove(name, Some(version)).await;
+        let version = matches.value_of("version");
+        remove(name, Some(version.unwrap())).await;
     } else if let Some(_matches) = matches.subcommand_matches("list") {
         list().await;
     } else {
@@ -128,7 +128,7 @@ async fn install(name: &str, version: Option<&str>) {
     let client = Client::new();
 
     let version = match version {
-        Some(v) => v.unwrap().to_string(),
+        Some(v) => v.to_string(),
         None => {
             match get_latest_version(name).await {
                 Some(v) => v,
@@ -145,7 +145,7 @@ async fn install(name: &str, version: Option<&str>) {
     let url = format!("http://localhost:5000/packages/{}-{}", name, version);
     let response = client.get(&url).send().await.expect("Failed to send request");
 
-    let file_path = format!("{}-{}.xz", name, version);
+    let file_path = format!("/tmp/{}-{}.xz", name, version);
 
     if response.status().is_success() {
         let response_bytes = response.bytes().await.expect("Failed to read response bytes");
