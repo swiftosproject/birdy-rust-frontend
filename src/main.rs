@@ -1,5 +1,6 @@
 use clap::{App, Arg, SubCommand};
 use tokio::fs;
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use reqwest::header::SET_COOKIE;
 use reqwest::Client;
@@ -38,6 +39,16 @@ async fn main() {
                 .arg(Arg::with_name("name").help("The name of the package").required(true).index(1))
                 .arg(Arg::with_name("version").help("The version of the package").required(false).index(2)),
         )
+        .subcommand(
+            SubCommand::with_name("remove")
+                .about("Remove a package")
+                .arg(Arg::with_name("name").help("The name of the package").required(true).index(1))
+                .arg(Arg::with_name("version").help("The version of the package").required(false).index(2)),
+        )
+        .subcommand(
+            SubCommand::with_name("list")
+                .about("List all installed packages"),
+        )
         .get_matches();
 
     if let Some(matches) = matches.subcommand_matches("register") {
@@ -52,8 +63,12 @@ async fn main() {
         let name = matches.value_of("name").unwrap();
         let version = matches.value_of("version").unwrap();
         install(name, Some(version)).await;
-    } else if let Some(_) = matches.subcommand_matches("install") {
-        println!("Install command not implemented yet");
+    } else if let Some(matches) = matches.subcommand_matches("remove") {
+        let name = matches.value_of("name").unwrap();
+        let version = matches.value_of("version").unwrap();
+        remove(name, Some(version)).await;
+    } else if let Some(_matches) = matches.subcommand_matches("list") {
+        list().await;
     } else {
         eprintln!("No valid subcommand was provided");
     }
@@ -129,7 +144,8 @@ async fn install(name: &str, version: Option<&str>) {
 
     let url = format!("http://localhost:5000/packages/{}-{}", name, version);
     let response = client.get(&url).send().await.expect("Failed to send request");
-    let file_path = format!("{}-{}.xz", name, version);
+
+    let file_path = format!("/tmp/{}-{}.xz", name, version);
 
     if response.status().is_success() {
         let response_bytes = response.bytes().await.expect("Failed to read response bytes");
@@ -151,8 +167,60 @@ async fn install(name: &str, version: Option<&str>) {
 
     // Extract the downloaded file to "/"
     let extract_path = Path::new("/");
-    let extract_result = tar::Archive::new(File::open(&file_path).expect("Unable to open file")).unpack(extract_path);
+    let mut archive = tar::Archive::new(File::open(&file_path).expect("Unable to open file"));
+    let extract_result = archive.unpack(extract_path);
+    
+    // Save the names and folders
+    let mut names_and_folders: Vec<String>;
+    match extract_result {
+        Ok(_) => {
+            println!("Package extracted successfully to {}", extract_path.display());
+            // Save the names and folders
+            names_and_folders = Vec::new();
+            let mut entries = archive.entries().expect("Failed to read entries");
+            while let Some(result) = entries.next() {
+                let entry = result.expect("Failed to read entry");
+                let path = entry.path().expect("Failed to read path");
+                let name = path.to_string_lossy().to_string();
+                names_and_folders.push(name.clone());
+            }
+        }
+        Err(e) => {
+            println!("Failed to extract package: {}", e);
+            return;
+        }
+    }
 
+    let data_file = "/var/lib/birdy/data.json";
+    // Read the existing data
+    let mut file = tokio::fs::File::open(data_file).await.unwrap();
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents).await.unwrap();
+    let contents = String::from_utf8_lossy(&contents);
+
+    // Parse the existing data
+    let mut data: Vec<serde_json::Value> = serde_json::from_str(&contents).unwrap_or_else(|_| vec![]);
+
+    // Create the new data
+    let new_data = serde_json::json!({
+        "name": name,
+        "version": version,
+        "files": names_and_folders,
+    });
+
+    // Append the new data
+    data.push(new_data);
+
+    // Convert the data back to a JSON string
+    let json_data = serde_json::to_string(&data).expect("Failed to convert data to JSON");
+
+    // Write the JSON string back to the file
+    tokio::fs::write(data_file, json_data)
+        .await
+        .expect("Unable to write data file");
+
+    println!("Data saved to {}", data_file);
+    
     match extract_result {
         Ok(_) => {
             println!("Package extracted successfully to {}", extract_path.display());
@@ -162,7 +230,94 @@ async fn install(name: &str, version: Option<&str>) {
         }
     }
 
+    // Remove the downloaded file
+    tokio::fs::remove_file(&file_path).await.expect("Unable to remove file");
+
     println!("{}-{} Package downloaded successfully and Installed to {}", name, version, file_path);
+}
+
+async fn remove(name: &str, version: Option<&str>) {
+    let version = match version {
+        Some(v) => v.to_string(),
+        None => {
+            match get_latest_version(name).await {
+                Some(v) => v,
+                None => {
+                    println!("Unable to determine the latest version for {}", name);
+                    return;
+                }
+            }
+        }
+    };
+
+    println!("Removing {} version {}", name, version);
+
+    let data_file = "/var/lib/birdy/data.json";
+    // Read the existing data
+    let mut file = tokio::fs::File::open(data_file).await.unwrap();
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents).await.unwrap();
+    let contents = String::from_utf8_lossy(&contents);
+
+    // Parse the existing data
+    let mut data: Vec<serde_json::Value> = serde_json::from_str(&contents).unwrap_or_else(|_| vec![]);
+
+    // Find the package to remove
+    let mut index = None;
+    for (i, package) in data.iter().enumerate() {
+        let package_name = package["name"].as_str().unwrap();
+        let package_version = package["version"].as_str().unwrap();
+        if package_name == name && package_version == version {
+            index = Some(i);
+            break;
+        }
+    }
+
+    match index {
+        Some(i) => {
+            let package = &data[i];
+            let files = package["files"].as_array().unwrap();
+            for file in files {
+                let file = file.as_str().unwrap();
+                let path = format!("/{}", file);
+                tokio::fs::remove_file(&path).await.expect("Unable to remove file");
+                println!("Removed {}", path);
+            }
+            data.remove(i);
+        }
+        None => {
+            println!("Package {} version {} not found", name, version);
+            return;
+        }
+    }
+
+    // Convert the data back to a JSON string
+    let json_data = serde_json::to_string(&data).expect("Failed to convert data to JSON");
+
+    // Write the JSON string back to the file
+    tokio::fs::write(data_file, json_data)
+        .await
+        .expect("Unable to write data file");
+
+    println!("Data saved to {}", data_file);
+}
+
+async fn list() {
+    let data_file = "/var/lib/birdy/data.json";
+    // Read the existing data
+    let mut file = tokio::fs::File::open(data_file).await.unwrap();
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents).await.unwrap();
+    let contents = String::from_utf8_lossy(&contents);
+
+    // Parse the existing data
+    let data: Vec<serde_json::Value> = serde_json::from_str(&contents).unwrap_or_else(|_| vec![]);
+
+    for package in data {
+        let name = package["name"].as_str().unwrap();
+        let version = package["version"].as_str().unwrap();
+        println!("{}-{}", name, version);
+    }
 }
     
 
