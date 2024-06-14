@@ -154,18 +154,17 @@ async fn install(name: &str, version: Option<&str>) {
         let mut file = tokio::fs::File::create(&file_path).await;
 
         match file {
-            Ok(file) => {
-                // Continue with your code
+            Ok(mut file) => {
+                file.write_all(&package_data)
+                    .await
+                    .expect("Unable to write file");
+                println!("Package downloaded successfully and saved to {}", file_path);
             },
             Err(e) => {
                 eprintln!("Failed to create file: {}", e);
                 return;
             }
         }
-
-        file.write_all(&package_data)
-            .await
-            .expect("Unable to write file");
 
         println!("Package downloaded successfully and saved to {}", file_path);
     } else {
