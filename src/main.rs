@@ -7,7 +7,8 @@ use reqwest::Client;
 use serde::Serialize;
 use std::path::Path;
 use std::fs::File;
-use tar;
+use tar::Archive;
+use flate2::read::GzDecoder;
 
 #[derive(Serialize)]
 struct User {
@@ -82,7 +83,7 @@ async fn register(username: &str, password: &str) {
     };
 
     let response = client
-        .post("http://localhost:5000/register")
+        .post("http://192.168.0.29:5000/register")
         .json(&user)
         .send()
         .await
@@ -100,7 +101,7 @@ async fn login(username: &str, password: &str) {
     };
 
     let response = client
-        .post("http://localhost:5000/login")
+        .post("http://192.168.0.29:5000/login")
         .json(&login)
         .send()
         .await
@@ -142,64 +143,98 @@ async fn install(name: &str, version: Option<&str>) {
 
     println!("Installing {} version {}", name, version);
 
-    let url = format!("http://localhost:5000/packages/{}-{}", name, version);
-    let response = client.get(&url).send().await.expect("Failed to send request");
+    let file_path = format!("/tmp/{}-{}.tar.gz", name, version);
+    if !Path::new(&file_path).exists() {
+        let url = format!("http://192.168.0.29:5000/packages/{}-{}", name, version);
+        let response = client.get(&url).send().await.expect("Failed to send request");
+        if response.status().is_success() {
+            let response_bytes = response.bytes().await.expect("Failed to read response bytes");
+            let package_data = response_bytes.clone();
+            let mut file = tokio::fs::File::create(&file_path).await;
 
-    let file_path = format!("/tmp/{}-{}.xz", name, version);
-
-    if response.status().is_success() {
-        let response_bytes = response.bytes().await.expect("Failed to read response bytes");
-        let package_data = response_bytes.clone();
-        
-        let mut file = tokio::fs::File::create(&file_path).await;
-
-        match file {
-            Ok(mut file) => {
-                file.write_all(&package_data)
+            match file {
+                Ok(mut file) => {
+                    file.write_all(&package_data)
                     .await
                     .expect("Unable to write file");
-                println!("Package downloaded successfully and saved to {}", file_path);
-            },
-            Err(e) => {
-                eprintln!("Failed to create file: {}", e);
-                return;
+                },
+                Err(e) => {
+                    eprintln!("Failed to create temp file: {}", e);
+                    return;
+                }
             }
-        }
-
-        println!("Package downloaded successfully and saved to {}", file_path);
+            println!("Package downloaded successfully and saved to {}", file_path);
+            } else {
+                println!("\x1b[31mError downloading package {}: {}\x1b[0m", name, response.status());
+            }
     } else {
-        println!("\x1b[31mError downloading package {}: {}\x1b[0m", name, response.status());
+        println!("Using existing file {}-{}.tar.gz", name, version);
     }
 
     // Extract the downloaded file to "/"
     let extract_path = Path::new("/");
-    let mut archive = tar::Archive::new(File::open(&file_path).expect("Unable to open file"));
-    let extract_result = archive.unpack(extract_path);
     
-    // Save the names and folders
-    let mut names_and_folders: Vec<String>;
+    // Open the file
+    let file = File::open(&file_path).expect("Unable to open file");
+
+    // Create the GzDecoder
+    let gz_decoder = GzDecoder::new(file);
+
+    // Create the Archive
+    let mut archive = Archive::new(gz_decoder);
+
+    // Unpack the archive
+    let extract_result = archive.unpack(extract_path);
+
     match extract_result {
-        Ok(_) => {
-            println!("Package extracted successfully to {}", extract_path.display());
-            // Save the names and folders
-            names_and_folders = Vec::new();
-            let mut entries = archive.entries().expect("Failed to read entries");
-            while let Some(result) = entries.next() {
-                let entry = result.expect("Failed to read entry");
-                let path = entry.path().expect("Failed to read path");
-                let name = path.to_string_lossy().to_string();
-                names_and_folders.push(name.clone());
-            }
-        }
+        Ok(_) => println!("Successfully extracted the package."),
         Err(e) => {
-            println!("Failed to extract package: {}", e);
+            eprintln!("Failed to extract package: {}", e);
+            eprintln!("IO error kind: {:?}", e.kind());
             return;
         }
     }
 
-    let data_file = "/var/lib/birdy/data.json";
+    // Save the names and folders
+    let mut names_and_folders: Vec<String> = Vec::new();
+    println!("Package extracted successfully to {}", extract_path.display());
+    // Save the names and folders
+    let mut entries = archive.entries().expect("Failed to read entries");
+    while let Some(result) = entries.next() {
+        match result {
+            Ok(entry) => {
+                let path = entry.path().expect("Failed to read path");
+                let name = path.to_string_lossy().to_string();
+                names_and_folders.push(name.clone());
+            }
+            Err(e) => {
+                println!("Failed to read entry: {}", e);
+                return;
+            }
+        }
+    }
+
+    let data_file = "data.json";
     // Read the existing data
-    let mut file = tokio::fs::File::open(data_file).await.unwrap();
+    let mut file = match tokio::fs::File::open(data_file).await {
+        Ok(file) => {
+            println!("File opened successfully");
+            file
+        },
+        Err(_) => {
+            println!("Failed to open file, trying to create file");
+            match tokio::fs::File::create(data_file).await {
+                Ok(file) => {
+                    println!("File created successfully");
+                    file
+                },
+                Err(e) => {
+                    eprintln!("Failed to create file: {}", e);
+                    return;
+                }
+            }
+        }
+    };
     let mut contents = Vec::new();
     file.read_to_end(&mut contents).await.unwrap();
     let contents = String::from_utf8_lossy(&contents);
@@ -215,7 +250,11 @@ async fn install(name: &str, version: Option<&str>) {
     });
 
     // Append the new data
-    data.push(new_data);
+    if data.is_empty() {
+        data = [new_data].to_vec();
+    } else {
+        data.push(new_data);
+    }
 
     // Convert the data back to a JSON string
     let json_data = serde_json::to_string(&data).expect("Failed to convert data to JSON");
@@ -226,15 +265,7 @@ async fn install(name: &str, version: Option<&str>) {
         .expect("Unable to write data file");
 
     println!("Data saved to {}", data_file);
-    
-    match extract_result {
-        Ok(_) => {
-            println!("Package extracted successfully to {}", extract_path.display());
-        }
-        Err(e) => {
-            println!("Failed to extract package: {}", e);
-        }
-    }
+    println!("Package installed successfully");
 
     // Remove the downloaded file
     tokio::fs::remove_file(&file_path).await.expect("Unable to remove file");
@@ -329,7 +360,7 @@ async fn list() {
 
 async fn get_latest_version(name: &str) -> Option<String> {
     let client = Client::new();
-    let url = format!("http://localhost:5000/versions/{}", name);
+    let url = format!("http://192.168.0.29:5000/versions/{}", name);
     let response = client.get(&url).send().await;
 
     match response {
