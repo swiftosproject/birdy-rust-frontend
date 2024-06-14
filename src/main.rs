@@ -151,10 +151,17 @@ async fn install(name: &str, version: Option<&str>) {
         let response_bytes = response.bytes().await.expect("Failed to read response bytes");
         let package_data = response_bytes.clone();
         
-        // Save the package data to a file
-        let mut file = tokio::fs::File::create(&file_path)
-            .await
-            .expect("Unable to create file");
+        let mut file = tokio::fs::File::create(&file_path).await;
+
+        match file {
+            Ok(file) => {
+                // Continue with your code
+            },
+            Err(e) => {
+                eprintln!("Failed to create file: {}", e);
+                return;
+            }
+        }
 
         file.write_all(&package_data)
             .await
