@@ -145,7 +145,7 @@ async fn install(name: &str, version: Option<&str>) {
 
     let file_path = format!("/tmp/{}-{}.tar.gz", name, version);
     if !Path::new(&file_path).exists() {
-        let url = format!("http://192.168.0.29:5000/packages/{}-{}", name, version);
+        let url = format!("http://192.168.0.29:5000/packages/{}/{}", name, version);
         let response = client.get(&url).send().await.expect("Failed to send request");
         if response.status().is_success() {
             let response_bytes = response.bytes().await.expect("Failed to read response bytes");
@@ -360,7 +360,7 @@ async fn list() {
 
 async fn get_latest_version(name: &str) -> Option<String> {
     let client = Client::new();
-    let url = format!("http://192.168.0.29:5000/versions/{}", name);
+    let url = format!("http://192.168.0.29:5000/packages/{}/versions", name);
     let response = client.get(&url).send().await;
 
     match response {
