@@ -38,7 +38,14 @@ async fn main() {
             SubCommand::with_name("install")
                 .about("Install a package")
                 .arg(Arg::with_name("name").help("The name of the package").required(true).index(1))
-                .arg(Arg::with_name("version").help("The version of the package").required(false).index(2)),
+                .arg(Arg::with_name("version").help("The version of the package").required(false).index(2))
+                .arg(Arg::with_name("location")
+                    .short('r')
+                    .long("root")
+                    .value_name("location")
+                    .help("The Location to Install the Package to.")
+                    .takes_value(true)
+                    .required(false)),
         )
         .subcommand(
             SubCommand::with_name("remove")
@@ -63,7 +70,9 @@ async fn main() {
     } else if let Some(matches) = matches.subcommand_matches("install") {
         let name = matches.value_of("name").unwrap();
         let version = matches.value_of("version");
-        install(name, version).await;
+        let location_str = matches.value_of("location").unwrap_or("/");
+        let location = Path::new(location_str);
+        install(name, version, location).await;
     } else if let Some(matches) = matches.subcommand_matches("remove") {
         let name = matches.value_of("name").unwrap();
         let version = matches.value_of("version");
@@ -125,7 +134,7 @@ async fn login(username: &str, password: &str) {
     }
 }
 
-async fn install(name: &str, version: Option<&str>) {
+async fn install(name: &str, version: Option<&str>, location: &Path) {
     let client = Client::new();
 
     let version = match version {
@@ -172,7 +181,7 @@ async fn install(name: &str, version: Option<&str>) {
     }
 
     // Extract the downloaded file to "/"
-    let extract_path = Path::new("/");
+    let extract_path = location;
     
     // Open the file
     let file = File::open(&file_path).expect("Unable to open file");
@@ -247,6 +256,7 @@ async fn install(name: &str, version: Option<&str>) {
         "name": name,
         "version": version,
         "files": names_and_folders,
+        "install-loc": extract_path,
     });
 
     // Append the new data
@@ -314,9 +324,10 @@ async fn remove(name: &str, version: Option<&str>) {
         Some(i) => {
             let package = &data[i];
             let files = package["files"].as_array().unwrap();
+            let install_loc = package["install-loc"].as_str().unwrap();
             for file in files {
                 let file = file.as_str().unwrap();
-                let path = format!("/{}", file);
+                let path = format!("{}{}", install_loc, file);
                 tokio::fs::remove_file(&path).await.expect("Unable to remove file");
                 println!("Removed {}", path);
             }
@@ -353,7 +364,8 @@ async fn list() {
     for package in data {
         let name = package["name"].as_str().unwrap();
         let version = package["version"].as_str().unwrap();
-        println!("{}-{}", name, version);
+        let install_loc = package["install-loc"].as_str().unwrap();
+        println!("{}-{}-{}", name, version, install_loc);
     }
 }
     
